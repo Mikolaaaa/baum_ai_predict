@@ -1,0 +1,758 @@
+import psycopg2
+import asyncio
+import pandas as pd
+import matplotlib
+from filter import filter_shd
+from prognoz import prediction_linear_regression_shd
+from visual import vis_overload_realtime
+from new_data_to_df_log import new_data_to_df_log
+from fastapi import FastAPI, HTTPException, WebSocket, APIRouter
+from fastapi.middleware.cors import CORSMiddleware
+from dotenv import load_dotenv
+import os
+import logging
+from auth.router import APIAuthRouter
+from auth.router import APIUserRouter
+from fastapi_restful import Api
+import httpx
+from datetime import datetime
+
+# Настройка логгера
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+matplotlib.use('Agg')
+
+app = FastAPI()
+router = APIAuthRouter()
+app.include_router(router)
+# myapi = APIUserRouter()
+# api.add_resource(myapi, "/users")
+u_router = APIUserRouter()
+app.include_router(u_router)
+
+app.add_middleware(CORSMiddleware, allow_origins=["*"],
+                   allow_credentials=True,
+                   allow_methods=["*"], allow_headers=['*'])
+load_dotenv()
+
+host = os.getenv("HOST")
+port = os.getenv("PORT")
+database = os.getenv("DATABASE")
+user = os.getenv("USER")
+password = os.getenv("PASSWORD")
+connect_timeout = os.getenv("connect_timeout")
+
+host_predict = os.getenv("HOST_PREIDICT")
+
+# Параметры подключения к PostgreSQL
+db_params = {
+    'host': host,
+    'port': port,
+    'database': database,
+    'user': user,
+    'password': password,
+    'connect_timeout': connect_timeout
+}
+
+prev_data = {}
+
+data_mega = {}
+
+offset = 0
+
+result_shd_all = pd.DataFrame()
+
+
+def execute_query_v2(query):
+    try:
+        # Устанавливаем соединение с базой данных
+        connection = psycopg2.connect(**db_params)
+        cursor = connection.cursor()
+
+        print(query)
+
+        # Выполняем SQL-запрос
+        cursor.execute(query)
+
+        # Получаем результаты запроса
+        result = cursor.fetchall()
+
+        # Получаем метаданные о столбцах
+        column_names = [desc[0] for desc in cursor.description]
+
+        # Фиксируем изменения в базе данных
+        connection.commit()
+
+        # Закрываем курсор и соединение
+        cursor.close()
+        connection.close()
+
+        # Возвращаем результаты запроса и имена столбцов
+        logger.info("execute_query_v2")
+        return result, column_names
+
+    except psycopg2.Error as e:
+        print(f"Ошибка при выполнении запроса: {e}")
+
+
+# Функция для выполнения SQL-запроса к PostgreSQL
+def execute_query(query):
+    while True:
+        try:
+            connection = psycopg2.connect(**db_params)
+            cursor = connection.cursor()
+
+            cursor.execute(query)
+
+            # Если запрос начинается с SELECT, получаем результат
+            if query.strip().lower().startswith('select'):
+                # Получение метаданных о столбцах
+                column_names = [desc[0] for desc in cursor.description]
+                result = cursor.fetchall()
+            else:
+                result = None
+
+            connection.commit()
+
+            cursor.close()
+            connection.close()
+
+            # Возвращаем результат и названия столбцов
+            logger.info("execute_query")
+            return result, column_names if 'column_names' in locals() else None
+
+
+        except psycopg2.OperationalError as e:
+            print(f"Ошибка при выполнении запроса: {e}")
+            print("Повторная попытка подключения через 5 секунд...")
+
+        except Exception as e:
+            print(f"Произошла ошибка: {e}")
+            return None
+
+
+def execute_query_v3(query, params=None):
+    try:
+        # Устанавливаем соединение с базой данных
+        connection = psycopg2.connect(**db_params)
+        cursor = connection.cursor()
+
+        print(query)
+
+        # Выполняем SQL-запрос с параметрами
+        cursor.execute(query, params)
+
+        # Если запрос был SELECT, то получаем результаты
+        result = None
+        column_names = None
+        if cursor.description:
+            result = cursor.fetchall()
+            column_names = [desc[0] for desc in cursor.description]
+
+        # Фиксируем изменения в базе данных
+        connection.commit()
+
+        # Закрываем курсор и соединение
+        cursor.close()
+        connection.close()
+
+        # Возвращаем результаты запроса и имена столбцов
+        logger.info("execute_query_v2")
+        return result, column_names
+
+    except psycopg2.Error as e:
+        print(f"Ошибка при выполнении запроса: {e}")
+        logger.error(f"Ошибка при выполнении запроса: {e}")
+
+
+"""result_shd, column_names_shd = execute_query('select * from shd_from_csv')
+
+if result_shd is not None:
+    df_shd = pd.DataFrame(result_shd, columns=column_names_shd)
+
+result_level, column_names_level = execute_query('select * from level')
+if result_level is not None:
+    df_levels = pd.DataFrame(result_level, columns=column_names_level)"""
+
+# print('df_shd')
+# print(df_shd)
+
+# print('df_levels')
+# print(df_levels)
+
+"""vars_dict_real = {
+    'features_columns': ['time'],  # Список колонок признаков, включая время sigh
+    'targets_columns': ['Capacity usage(%)'],  # Список колонок целевых признаков target
+}"""
+
+
+@app.get("/api/shd")
+async def get_all_shd():
+    try:
+
+        records = execute_query("SELECT * FROM shd_s")
+
+        return {"status": "success", "data": records}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"An error occurred: {e}")
+
+
+@app.post("/api/post_shd")
+async def post_shd(data: dict):
+    try:
+        name = str(data.get('name'))
+        ip = str(data.get('ip'))
+        login = str(data.get('login'))
+        password = str(data.get('password'))
+
+        login_data = {
+            "login": login,
+            "password": password,
+            "remember": True  # Используем True с заглавной буквы
+        }
+
+        # Получение текущей даты и времени
+        current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
+
+        # Преобразование строки в объект datetime
+        datetime_object = datetime.strptime(current_time, "%Y-%m-%d %H:%M:%S.%f")
+
+        # Отправка POST-запроса с логином и паролем
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"http://172.16.11.24/api/v2.0/login",
+                json=login_data
+            )
+
+        # Проверка ответа
+        if response.status_code == 200:
+            query = "INSERT INTO shd_s (name, ip, login, password, datetime) VALUES (%s, %s, %s, %s, %s)"
+            params = (name, ip, login, password, datetime_object)
+            execute_query_v3(query, params)
+
+            create_table_query = f"""
+                        CREATE TABLE IF NOT EXISTS "{name}" (
+                            sn TEXT,
+                            "object type" TEXT,
+                            object TEXT,
+                            time TIMESTAMP,
+                            "Capacity usage(%)" NUMERIC,
+                            "Mapped LUN capacity(GB)" NUMERIC,
+                            "Total capacity(GB)" NUMERIC,
+                            "Used capacity(GB)" NUMERIC,
+                            array_num TEXT
+                        );
+                        """
+            execute_query(create_table_query)
+
+            return {"status": "success", "message": "Authentication successful"}
+        else:
+            return {"status": "failed", "message": "Authentication failed", "response.status_code": response.status_code}
+
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"An error occurred: {e}")
+
+
+@app.delete("/api/shd/{name}")
+async def delete_record(data: dict):
+    try:
+        name = str(data.get('name'))
+        execute_query(f"DELETE FROM shd_s WHERE name = '{name}'")
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"An error occurred: {e}")
+
+
+@app.post("/api/get_graph")
+async def get_shd_data(data: dict):
+    global prev_data, result_shd_all, offset, result_shd_all_vis
+    realtime = data.get('realtime')
+    offset = 0
+    """if realtime:
+        result_shd_all = pd.DataFrame()"""
+    prev_data = data
+    """realtime = data.get('realtime')
+    if realtime:
+        return"""
+
+    try:
+
+        print(data)
+        # Извлекаем необходимые параметры из данных
+        param = [item['key'] for item in data['param']]
+        sigh = str(data.get('sigh'))
+        target = str(data.get('target'))
+        sp_flag = data.get('sp_flag')
+        select_window_type = str(data.get('select_window_type'))
+        dropdown_block = data.get('dropdown_block', {})
+        levels_list = [item['key'] for item in data['levels_list']]
+        use_cloud = data.get('use_cloud')
+        realtime = data.get('realtime')
+        sqlRequest = str(data.get('sqlRequest'))
+        try:
+            sqlRequestLevel = data.get('sqlRequestLevel')
+            print(33)
+            execute_query(f"{sqlRequestLevel}")
+            print(33)
+            print(sqlRequestLevel)
+        except:
+            pass
+
+        print(param)
+        print(sigh)
+        print(target)
+        print(sp_flag)
+        print(select_window_type)
+        print(dropdown_block)
+        print(levels_list)
+        print(use_cloud)
+        print(sqlRequest)
+        print('realtime: ', realtime)
+
+        logger.info("get_shd_data param")
+
+        try:
+
+            """result_shd, column_names_shd = execute_query(f"{sqlRequest}")
+            if result_shd is not None:
+                df_shd = pd.DataFrame(result_shd, columns=column_names_shd)"""
+
+            if select_window_type == 'auto_interval':
+                # Разделение строки по пробелам
+                tablitsa = sqlRequest.split()
+                # Получение последнего слова
+                from_index = tablitsa.index('from')
+
+                # объединить части, начиная с элемента 'from'
+                from_clause = ' '.join(tablitsa[from_index:])
+
+                tablitsa = from_clause
+
+                print('tablitsa: ', tablitsa)
+                # Получение кол-ва строк датасета
+                if len(param) == 1:
+                    dlina = execute_query(f"SELECT COUNT(*) {tablitsa} WHERE object = '{param[0]}'")
+
+                    dlina = int(dlina[0][0][0])
+                    half_dlina = int(dlina / 2)
+
+                    print('dlina : ', dlina)
+                    print('half_dlina : ', half_dlina)
+
+                    result_shd, column_names_shd = execute_query(
+                        f"{sqlRequest} WHERE object = '{param[0]}' order by time LIMIT {half_dlina}")
+                elif len(param) == 2:
+                    dlina = execute_query(
+                        f"SELECT COUNT(*) {tablitsa} WHERE object = '{param[0]}' or object = '{param[1]}'")
+
+                    dlina = int(dlina[0][0][0])
+                    half_dlina = int(dlina / 2)
+                    if half_dlina % 2 != 0:  # Проверяем, является ли результат нечетным числом
+                        half_dlina += 1  # Если да, уменьшаем на 1, чтобы сделать четным
+                    print('dlina : ', dlina)
+                    print('half_dlina : ', half_dlina)
+
+                    result_shd, column_names_shd = execute_query(
+                        f"{sqlRequest} WHERE object = '{param[0]}' or object = '{param[1]}' order by time LIMIT {half_dlina}")
+
+                elif len(param) == 3:
+                    dlina = execute_query(
+                        f"SELECT COUNT(*) {tablitsa} WHERE object = '{param[0]}' or object = '{param[1]}' or object = '{param[2]}'")
+
+                    dlina = int(dlina[0][0][0])
+                    half_dlina = int(dlina / 2)
+                    if half_dlina % 3 != 0:  # Проверяем, делится ли результат на 3 с остатком
+                        half_dlina += (3 - half_dlina % 3)  # Увеличиваем на оставшееся до ближайшего кратного числа 3
+                    print('dlina : ', dlina)
+                    print('half_dlina : ', half_dlina)
+
+                    result_shd, column_names_shd = execute_query(
+                        f"{sqlRequest} WHERE object = '{param[0]}' or object = '{param[1]}' or object = '{param[2]}' order by time LIMIT {half_dlina}")
+
+                offset = half_dlina
+
+                if result_shd is not None:
+                    df_shd = pd.DataFrame(result_shd, columns=column_names_shd)
+                    logger.info("auto_interval result_shd")
+
+            elif select_window_type == 'advanced_interval':
+                # Разделение строки по пробелам
+                tablitsa = sqlRequest.split()
+                # Получение последнего слова
+                # Разделение строки по пробелам
+                tablitsa = sqlRequest.split()
+                # Получение последнего слова
+                from_index = tablitsa.index('from')
+
+                # объединить части, начиная с элемента 'from'
+                from_clause = ' '.join(tablitsa[from_index:])
+
+                tablitsa = from_clause
+
+                gap = dropdown_block['interval']
+                num = dropdown_block['interval_num']
+
+                if gap == 'День':
+                    gap = 'day'
+                elif gap == 'Неделя':
+                    gap = 'week'
+                elif gap == 'Месяц':
+                    gap = 'month'
+                elif gap == 'Год':
+                    gap = 'year'
+
+                if len(param) == 1:
+                    dlina = execute_query(f"SELECT COUNT(*) {tablitsa} WHERE object = '{param[0]}'")
+
+                    dlina = int(dlina[0][0][0])
+                    half_dlina = int(dlina / 2)
+
+                    print('dlina : ', dlina)
+                    print('half_dlina : ', half_dlina)
+
+                    mean_row = execute_query(
+                        f"SELECT time {tablitsa} WHERE object = '{param[0]}' order by time offset {half_dlina - 1} limit 1")
+
+                    mean_row = mean_row[0][0][0]
+
+                    print('mean_row', mean_row)
+
+                    result_shd, column_names_shd = execute_query(
+                        f"{sqlRequest} WHERE object = '{param[0]}' AND time >= DATE '{mean_row}' - INTERVAL '{num} {gap}' AND time <= DATE '{mean_row}' order by time LIMIT {half_dlina}")
+                    result_shd_vis, column_names_shd_visual = execute_query(
+                        f"{sqlRequest} WHERE object = '{param[0]}' order by time LIMIT {half_dlina}")
+                elif len(param) == 2:
+                    dlina = execute_query(
+                        f"SELECT COUNT(*) {tablitsa} WHERE object = '{param[0]}' or object = '{param[1]}'")
+
+                    dlina = int(dlina[0][0][0])
+                    half_dlina = int(dlina / 2)
+                    if half_dlina % 2 != 0:  # Проверяем, является ли результат нечетным числом
+                        half_dlina += 1  # Если да, уменьшаем на 1, чтобы сделать четным
+                    print('dlina : ', dlina)
+                    print('half_dlina : ', half_dlina)
+
+                    mean_row = execute_query(
+                        f"SELECT time {tablitsa} WHERE object = '{param[0]}' or object = '{param[1]}' order by time offset {half_dlina - 1} limit 2")
+
+                    mean_row = mean_row[0][0][0]
+
+                    print('mean_row', mean_row)
+
+                    result_shd, column_names_shd = execute_query(
+                        f"{sqlRequest} WHERE (object = '{param[0]}' or object = '{param[1]}') AND time >= DATE '{mean_row}' - INTERVAL '{num} {gap}' AND time <= DATE '{mean_row}' order by time LIMIT {half_dlina}")
+                    result_shd_vis, column_names_shd_visual = execute_query(
+                        f"{sqlRequest} WHERE object = '{param[0]}' or object = '{param[1]}' order by time LIMIT {half_dlina}")
+                elif len(param) == 3:
+                    dlina = execute_query(
+                        f"SELECT COUNT(*) {tablitsa} WHERE object = '{param[0]}' or object = '{param[1]}' or object = '{param[2]}'")
+
+                    dlina = int(dlina[0][0][0])
+                    half_dlina = int(dlina / 2)
+                    if half_dlina % 3 != 0:  # Проверяем, делится ли результат на 3 с остатком
+                        half_dlina += (3 - half_dlina % 3)  # Увеличиваем на оставшееся до ближайшего кратного числа 3
+                    print('dlina : ', dlina)
+                    print('half_dlina : ', half_dlina)
+
+                    mean_row = execute_query(
+                        f"SELECT time {tablitsa} WHERE object = '{param[0]}' or object = '{param[1]}' or object = '{param[2]}' order by time offset {half_dlina - 1} limit 3")
+
+                    mean_row = mean_row[0][0][0]
+
+                    print('mean_row', mean_row)
+
+                    result_shd, column_names_shd = execute_query(
+                        f"{sqlRequest} WHERE (object = '{param[0]}' or object = '{param[1]}' or object = '{param[2]}') AND time >= DATE '{mean_row}' - INTERVAL '{num} {gap}' AND time <= DATE '{mean_row}' order by time LIMIT {half_dlina}")
+                    result_shd_vis, column_names_shd_visual = execute_query(
+                        f"{sqlRequest} WHERE object = '{param[0]}' or object = '{param[1]}' or object = '{param[2]}' order by time LIMIT {half_dlina}")
+
+                """if len(param) == 1:
+                    result_shd, column_names_shd = execute_query_v2(
+                        f"WITH start_date AS (SELECT MIN(time) AS start_date FROM {tablitsa} WHERE object = '{param[0]}'), end_date AS (SELECT (SELECT start_date FROM start_date) + INTERVAL '{num} {gap}' - INTERVAL '1 day' AS end_date) SELECT * FROM {tablitsa}, start_date, end_date WHERE (object = '{param[0]}') AND (time BETWEEN (SELECT start_date FROM start_date) AND (SELECT end_date FROM end_date)) ORDER BY time")
+                    dlina = execute_query_v2(
+                        f"WITH start_date AS (SELECT MIN(time) AS start_date FROM {tablitsa} WHERE object = '{param[0]}'), end_date AS (SELECT (SELECT start_date FROM start_date) + INTERVAL '{num} {gap}' - INTERVAL '1 day' AS end_date) SELECT COUNT(*) FROM {tablitsa}, start_date, end_date WHERE (object = '{param[0]}') AND (time BETWEEN (SELECT start_date FROM start_date) AND (SELECT end_date FROM end_date))")
+                    half_dlina = int(dlina[0][0][0])
+                elif len(param) == 2:
+                    result_shd, column_names_shd = execute_query_v2(
+                        f"WITH start_date AS (SELECT MIN(time) AS start_date FROM {tablitsa} WHERE object = '{param[0]}' or object = '{param[1]}'), end_date AS (SELECT (SELECT start_date FROM start_date) + INTERVAL '{num} {gap}' - INTERVAL '1 day' AS end_date) SELECT * FROM {tablitsa}, start_date, end_date WHERE (object = '{param[0]}' or object = '{param[1]}') AND (time BETWEEN (SELECT start_date FROM start_date) AND (SELECT end_date FROM end_date)) ORDER BY time")
+                    dlina = execute_query_v2(
+                        f"WITH start_date AS (SELECT MIN(time) AS start_date FROM {tablitsa} WHERE object = '{param[0]}'), end_date AS (SELECT (SELECT start_date FROM start_date) + INTERVAL '{num} {gap}' - INTERVAL '1 day' AS end_date) SELECT COUNT(*) FROM {tablitsa}, start_date, end_date WHERE (object = '{param[0]}' or object = '{param[1]}') AND (time BETWEEN (SELECT start_date FROM start_date) AND (SELECT end_date FROM end_date))")
+                    half_dlina = int(dlina[0][0][0])
+                elif len(param) == 3:
+                    result_shd, column_names_shd = execute_query_v2(
+                        f"WITH start_date AS (SELECT MIN(time) AS start_date FROM {tablitsa} WHERE object = '{param[0]}' or object = '{param[1]}' or object = '{param[2]}'), end_date AS (SELECT (SELECT start_date FROM start_date) + INTERVAL '{num} {gap}' - INTERVAL '1 day' AS end_date) SELECT * FROM {tablitsa}, start_date, end_date WHERE (object = '{param[0]}' or object = '{param[1]}' or object = '{param[2]}') AND (time BETWEEN (SELECT start_date FROM start_date) AND (SELECT end_date FROM end_date)) ORDER BY time")
+                    dlina = execute_query_v2(
+                        f"WITH start_date AS (SELECT MIN(time) AS start_date FROM {tablitsa} WHERE object = '{param[0]}'), end_date AS (SELECT (SELECT start_date FROM start_date) + INTERVAL '{num} {gap}' - INTERVAL '1 day' AS end_date) SELECT COUNT(*) FROM {tablitsa}, start_date, end_date WHERE (object = '{param[0]}' or object = '{param[1]}' or object = '{param[2]}') AND (time BETWEEN (SELECT start_date FROM start_date) AND (SELECT end_date FROM end_date))")
+                    half_dlina = int(dlina[0][0][0])"""
+
+                offset = half_dlina
+                if result_shd is not None:
+                    df_shd = pd.DataFrame(result_shd, columns=column_names_shd)
+
+                if result_shd_vis is not None:
+                    df_shd_vis = pd.DataFrame(result_shd_vis, columns=column_names_shd_visual)
+
+                logger.info("advanced_interval result_shd")
+
+            result_level, column_names_level = execute_query('select * from level')
+            if result_level is not None:
+                df_levels = pd.DataFrame(result_level, columns=column_names_level)
+
+            # print('df_shd')
+            # print(df_shd)
+
+            df_filter_shd, df_filter_level, error1 = filter_shd(df_shd, df_levels, param)
+            logger.info("filter_shd")
+            df_filter_shd_log, gui_dict1, error4 = new_data_to_df_log(df_filter_shd)
+            logger.info("new_data_to_df_log")
+            if select_window_type == 'advanced_interval':
+                df_filter_shd_vis, df_filter_level, error1 = filter_shd(df_shd_vis, df_levels, param)
+                df_filter_shd_vis_log, gui_dict1_vis, error4 = new_data_to_df_log(df_filter_shd_vis)
+
+            print(2)
+            vars_dict_real = {
+                'features_columns': [sigh],
+                'targets_columns': [target],
+            }
+            predict_model, df_predict, error2 = prediction_linear_regression_shd(df=df_filter_shd,
+                                                                                 df_levels=df_filter_level,
+                                                                                 vars_dict=vars_dict_real,
+                                                                                 sp_flag=sp_flag,
+                                                                                 select_window_type=select_window_type,
+                                                                                 dropdown_block=dropdown_block,
+                                                                                 levels_list=levels_list,
+                                                                                 use_cloud=use_cloud)
+            print(3)
+            logger.info("prediction_linear_regression_shd")
+            df_predict_log, gui_dict2, error5 = new_data_to_df_log(df_predict)
+            logger.info("new_data_to_df_log")
+            if select_window_type == 'advanced_interval':
+                result, error3 = vis_overload_realtime(df_filter_shd_vis_log, df_predict_log, df_filter_level)
+                logger.info("vis_overload_realtime")
+            else:
+                result, error3 = vis_overload_realtime(df_filter_shd_log, df_predict_log, df_filter_level)
+                logger.info("vis_overload_realtime")
+
+            result_shd_all = df_shd
+            if select_window_type == 'advanced_interval':
+                result_shd_all_vis = df_shd_vis
+                logger.info("advanced_interval")
+        except Exception as e:
+            if type(e).__name__ == 'OutOfBoundsDatetime':
+                # Если возникает ошибка "OutOfBoundsDatetime", возвращаем ошибку сервера
+                raise HTTPException(status_code=500, detail=(
+                        'Невозможно построить график, т.к. крайняя точка очень удалена по времени\n' + str(e) +
+                        '\nРекомендуем убрать галочку с параметра "облако точек"'
+                ))
+            elif type(e).__name__ == 'OverflowError':
+                # Если возникает ошибка "timestamp out of range for platform time_t", возвращаем ошибку сервера
+                raise HTTPException(status_code=500, detail=(
+                        'Невозможно построить график, т.к. временная метка находится вне допустимого диапазона\n' + str(
+                    e) +
+                        '\nРекомендуем изменить временной дипазон"'
+                ))
+            elif type(e).__name__ == 'ValueError' and 'is out of range' in str(e):
+                # Если возникает ошибка "year is out of range", возвращаем ошибку сервера
+                raise HTTPException(status_code=500, detail=(
+                        'Невозможно построить график, т.к. год находится вне допустимого диапазона\n' + str(e) +
+                        '\nРекомендуем проверить годы"'
+                ))
+            elif type(e).__name__ == 'KeyError':
+                # Если возникает ошибка "timestamp out of range for platform time_t", возвращаем ошибку сервера
+                raise HTTPException(status_code=500, detail=(
+                        'Неверно введены значения признаков/целевых признаков\n' + str(e) +
+                        '\nРекомендуем проверить введенные значения"'
+                ))
+            elif type(e).__name__ == 'ValueError':
+                raise HTTPException(status_code=500, detail=(
+                        'Нет значений для построения графика\n' + str(e) +
+                        '\nРекомендуем проверить датасет"'
+                ))
+            else:
+                # В остальных случаях возвращаем общую ошибку сервера
+                raise HTTPException(status_code=500, detail=str(e))
+        # Возвращаем отфильтрованные данные в формате JSON
+        return result
+    except Exception as e:
+        # Если возникает ошибка, возвращаем ошибку сервера
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.websocket("/api/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+
+    global prev_data, result_shd_all, offset, data_mega, result_shd_all_vis
+    x = 0
+    while True:
+        if prev_data:
+            try:
+                print('prev_data : ', prev_data)
+                print('data_mega : ', data_mega)
+                if data_mega != prev_data and data_mega != {}:
+                    await asyncio.sleep(6)
+                    x = 1
+                else:
+                    pass
+                data_mega = prev_data
+                data = prev_data  # Копируем данные для избежания изменения исходных данных
+                # Извлекаем необходимые параметры из данных
+                param = [item['key'] for item in data['param']]
+                l = len(param)
+                print(param)
+                sigh = str(data.get('sigh'))
+                target = str(data.get('target'))
+                sp_flag = data.get('sp_flag')
+                select_window_type = str(data.get('select_window_type'))
+                dropdown_block = data.get('dropdown_block', {})
+                levels_list = [item['key'] for item in data['levels_list']]
+                use_cloud = data.get('use_cloud')
+                sqlRequest = str(data.get('sqlRequest'))
+                try:
+                    sqlRequestLevel = data.get('sqlRequestLevel')
+                    print(33)
+                    execute_query(f"{sqlRequestLevel}")
+                    print(33)
+                    print(sqlRequestLevel)
+                except:
+                    pass
+
+                print(param)
+                print(sigh)
+                print(target)
+                print(sp_flag)
+                print(select_window_type)
+                print(dropdown_block)
+                print(levels_list)
+                print(use_cloud)
+                print(sqlRequest)
+                try:
+
+                    if len(param) == 1:
+                        result_shd, column_names_shd = execute_query(
+                            f"{sqlRequest} where object = '{param[0]}' ORDER BY time LIMIT {l} offset {offset}")
+                    elif len(param) == 2:
+                        result_shd, column_names_shd = execute_query(
+                            f"{sqlRequest} where object = '{param[0]}' or object = '{param[1]}' ORDER BY time LIMIT {l} offset {offset}")
+                    elif len(param) == 3:
+                        result_shd, column_names_shd = execute_query(
+                            f"{sqlRequest} where object = '{param[0]}' or object = '{param[1]}' or object = '{param[2]}' ORDER BY time LIMIT {l} offset {offset}")
+                    # result_shd, column_names_shd = execute_query(f"select * from shd_from_csv_v2 where object = 'System' ORDER BY time LIMIT 1 offset {offset}")
+
+                    print('xxxxxxx')
+                    print(result_shd)
+                    print('xxxxxxx')
+                    if result_shd is not None:
+                        # Создайте DataFrame из результата запроса
+                        df_shd = pd.DataFrame(result_shd, columns=column_names_shd)
+
+                        print(df_shd)
+                        print(result_shd_all)
+
+                        result_shd_all_old = result_shd_all
+                        # Добавьте данные к общему DataFrame
+                        result_shd_all = pd.concat([result_shd_all, df_shd], ignore_index=True)
+                        if select_window_type == 'advanced_interval':
+                            result_shd_all_vis = pd.concat([result_shd_all_vis, df_shd], ignore_index=True)
+                        print('result_shd_all_old')
+                        print(result_shd_all_old.to_string())
+                        print('result_shd_all')
+                        print(result_shd_all.to_string())
+                        print('offset = ', offset)
+                        if result_shd_all_old.equals(result_shd_all):
+                            pass
+                        else:
+                            offset += l
+                            result_shd_all.drop(result_shd_all.index[:l], inplace=True)
+
+                    result_level, column_names_level = execute_query('select * from level')
+                    if result_level is not None:
+                        df_levels = pd.DataFrame(result_level, columns=column_names_level)
+                    print(228)
+
+                    df_filter_shd, df_filter_level, error1 = filter_shd(result_shd_all, df_levels, param)
+                    df_filter_shd_log, gui_dict1, error4 = new_data_to_df_log(df_filter_shd)
+                    if select_window_type == 'advanced_interval':
+                        df_filter_shd_vis, df_filter_level, error1 = filter_shd(result_shd_all_vis, df_levels, param)
+                        df_filter_shd_vis_log, gui_dict1_vis, error4 = new_data_to_df_log(df_filter_shd_vis)
+                    print(229)
+
+                    print(df_levels)
+                    print(df_filter_level)
+
+                    print(230)
+                    vars_dict_real = {
+                        'features_columns': [sigh],
+                        'targets_columns': [target],
+                    }
+                    predict_model, df_predict, error2 = prediction_linear_regression_shd(df=df_filter_shd,
+                                                                                         df_levels=df_filter_level,
+                                                                                         vars_dict=vars_dict_real,
+                                                                                         sp_flag=sp_flag,
+                                                                                         select_window_type=select_window_type,
+                                                                                         dropdown_block=dropdown_block,
+                                                                                         levels_list=levels_list,
+                                                                                         use_cloud=use_cloud)
+                    print(231)
+                    df_predict_log, gui_dict2, error5 = new_data_to_df_log(df_predict)
+                    print(232)
+                    if select_window_type == 'advanced_interval':
+                        result, error3 = vis_overload_realtime(df_filter_shd_vis_log, df_predict_log, df_filter_level)
+                    else:
+                        result, error3 = vis_overload_realtime(df_filter_shd_log, df_predict_log, df_filter_level)
+                    print(233)
+                except Exception as e:
+                    if type(e).__name__ == 'OutOfBoundsDatetime':
+                        # Если возникает ошибка "OutOfBoundsDatetime", возвращаем ошибку сервера
+                        raise HTTPException(status_code=500, detail=(
+                                'Невозможно построить график, т.к. крайняя точка очень удалена по времени\n' + str(e) +
+                                '\nРекомендуем убрать галочку с параметра "облако точек"'
+                        ))
+                    elif type(e).__name__ == 'OverflowError':
+                        # Если возникает ошибка "timestamp out of range for platform time_t", возвращаем ошибку сервера
+                        raise HTTPException(status_code=500, detail=(
+                                'Невозможно построить график, т.к. временная метка находится вне допустимого диапазона\n' + str(
+                            e) +
+                                '\nРекомендуем изменить временной дипазон"'
+                        ))
+                    elif type(e).__name__ == 'ValueError' and 'is out of range' in str(e):
+                        # Если возникает ошибка "year is out of range", возвращаем ошибку сервера
+                        raise HTTPException(status_code=500, detail=(
+                                'Невозможно построить график, т.к. год находится вне допустимого диапазона\n' + str(e) +
+                                '\nРекомендуем проверить годы"'
+                        ))
+                    elif type(e).__name__ == 'KeyError':
+                        # Если возникает ошибка "timestamp out of range for platform time_t", возвращаем ошибку сервера
+                        raise HTTPException(status_code=500, detail=(
+                                'Неверно введены значения признаков/целевых признаков\n' + str(e) +
+                                '\nРекомендуем проверить введенные значения"'
+                        ))
+                    elif type(e).__name__ == 'ValueError':
+                        raise HTTPException(status_code=500, detail=(
+                                'Нет значений для построения графика\n' + str(e) +
+                                '\nРекомендуем проверить датасет"'
+                        ))
+                    else:
+                        print(type(e))
+                        # В остальных случаях возвращаем общую ошибку сервера
+                        raise HTTPException(status_code=500, detail=str(e))
+                # Возвращаем отфильтрованные данные в формате JSON
+                await websocket.send_json(result)
+            except Exception as e:
+                await websocket.send_text(f"Error: {str(e)}")
+        print('offset = ', offset)
+        print('x = ', x)
+        if x == 1:
+            await asyncio.sleep(6)
+            x = 0
+        else:
+            await asyncio.sleep(6)
+
+
+if __name__ == '__main__':
+    import uvicorn
+
+    uvicorn.run(app, host=host_predict, port=8000)
